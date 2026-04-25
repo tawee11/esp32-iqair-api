@@ -1,26 +1,26 @@
 /*
   ESP32-S3 YD-ESP32-23 V1.3
-  IQAir AQI -> RGB LED
-  Deep sleep version
+  IQAir AQI by lat/lon -> RGB LED
 
-  Logic:
-  - First boot / power on:
-      * try default Wi-Fi 5 attempts
-      * rainbow while connecting
-      * if fail -> AP mode for configuration
-      * if success -> fetch AQI immediately, update LED, wait 5 min, then deep sleep 10 min
-  - Wake from deep sleep:
-      * try default Wi-Fi 5 attempts
-      * if success -> fetch AQI immediately, update LED, show briefly, deep sleep 10 min
-      * if fail -> deep sleep 10 min
-      * no AP mode after timer wake
+  Features
+  - Boot: try saved Wi-Fi first
+  - If failed after 3 attempts -> AP config mode
+  - Config page allows:
+      * WPA/WPA2 Personal
+      * WPA2 Enterprise (PEAP)
+      * IQAir API Key
+      * Latitude / Longitude
+      * Use phone location (browser geolocation)
+      * Fallback manual lat/lon
+      * Scan SSID
+      * LED brightness slider 10-100%
+  - Poll IQAir every 10 minutes
+  - Use AQI from: data.current.pollution.aqius
+  - After Wi-Fi connected, fetch API immediately
 
-  Features:
-  - WPA/WPA2 Personal
-  - WPA2 Enterprise (PEAP)
-  - Scan SSID
-  - LED brightness slider 10-100%
-  - Use current.aqius
+  Required libraries:
+    - ArduinoJson
+    - Adafruit NeoPixel
 */
 
 #include <WiFi.h>
@@ -29,7 +29,6 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
-#include "esp_sleep.h"
 
 static const int LED_PIN = 48;
 
@@ -38,15 +37,11 @@ static const int LED_PIN = 48;
 // ---------------------------
 static const char* AP_SSID = "ESP32-IQAir-Config";
 static const char* AP_PASS = "12345678";
+static const char* IQAIR_BASE_URL = "http://api.airvisual.com/v2/nearest_city";
 
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
-static const uint8_t  WIFI_MAX_ATTEMPTS = 5;
-
-static const uint64_t SLEEP_INTERVAL_US = 10ULL * 60ULL * 1000000ULL;  // 10 นาที
-static const uint32_t CONFIG_WINDOW_MS  = 5UL  * 60UL * 1000UL;        // 5 นาที
-static const uint32_t WAKE_DISPLAY_MS   = 15000;                       // หลัง wake แสดงผล 15 วินาที
-
-RTC_DATA_ATTR uint32_t rtcBootCount = 0;
+static const uint8_t  WIFI_MAX_ATTEMPTS = 3;
+static const uint32_t POLL_INTERVAL_MS = 10UL * 60UL * 1000UL;
 
 // ---------------------------
 // Global objects
@@ -68,7 +63,11 @@ struct AppConfig {
   String username;
   String eapPassword;
 
-  String apiUrl;
+  // IQAir by lat/lon
+  String apiKey;
+  String latitude;
+  String longitude;
+
   uint8_t brightnessPercent; // 10..100
 };
 
@@ -76,14 +75,13 @@ AppConfig cfg;
 
 bool wifiConnected = false;
 bool apMode = false;
-bool previewMode = false;
-bool inConfigWindow = false;
-
-uint8_t previewR = 0, previewG = 0, previewB = 180;
-
-unsigned long awakeStartMs = 0;
+unsigned long lastPollMs = 0;
 unsigned long lastRainbowStepMs = 0;
 uint16_t rainbowIndex = 0;
+
+// preview control in AP mode
+bool previewMode = false;
+uint8_t previewR = 0, previewG = 0, previewB = 180;
 
 // ---------------------------
 // Helpers
@@ -95,6 +93,44 @@ String htmlEscape(const String& s) {
   out.replace(">", "&gt;");
   out.replace("\"", "&quot;");
   return out;
+}
+
+String urlEncodeSimple(const String& s) {
+  String out;
+  char hex[4];
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else {
+      snprintf(hex, sizeof(hex), "%%%02X", (unsigned char)c);
+      out += hex;
+    }
+  }
+  return out;
+}
+
+bool isValidLatLon(const String& latStr, const String& lonStr, float &lat, float &lon) {
+  if (latStr.isEmpty() || lonStr.isEmpty()) return false;
+
+  lat = latStr.toFloat();
+  lon = lonStr.toFloat();
+
+  bool latLooksZero = (lat == 0.0f && latStr != "0" && latStr != "0.0" && latStr != "0.00");
+  bool lonLooksZero = (lon == 0.0f && lonStr != "0" && lonStr != "0.0" && lonStr != "0.00");
+  if (latLooksZero || lonLooksZero) return false;
+
+  if (lat < -90.0f || lat > 90.0f) return false;
+  if (lon < -180.0f || lon > 180.0f) return false;
+
+  return true;
+}
+
+String buildIQAirUrl() {
+  return String(IQAIR_BASE_URL)
+       + "?lat=" + urlEncodeSimple(cfg.latitude)
+       + "&lon=" + urlEncodeSimple(cfg.longitude)
+       + "&key=" + urlEncodeSimple(cfg.apiKey);
 }
 
 uint8_t percentToNeoBrightness(uint8_t percent) {
@@ -121,7 +157,9 @@ void ledOff() {
 
 uint32_t wheel(byte pos) {
   pos = 255 - pos;
-  if (pos < 85) return pixel.Color(255 - pos * 3, 0, pos * 3);
+  if (pos < 85) {
+    return pixel.Color(255 - pos * 3, 0, pos * 3);
+  }
   if (pos < 170) {
     pos -= 85;
     return pixel.Color(0, pos * 3, 255 - pos * 3);
@@ -149,35 +187,289 @@ void blinkColor(uint8_t r, uint8_t g, uint8_t b, int times = 2, int onMs = 180, 
   }
 }
 
-// ---------------------------
-// AQI color mapping: 12 levels
-// แบ่งครึ่งแต่ละช่วงเดิม
-// ---------------------------
-void showAQIColorDetailed(int aqi) {
+void showAQIColor(int aqi) {
   previewMode = false;
 
-  if      (aqi <= 25)  setLed(0,   75,  0);    // Good low
-  else if (aqi <= 50)  setLed(0,  110,  0);    // Good high
-
-  else if (aqi <= 75)  setLed(120, 90,  0);    // Moderate low
-  else if (aqi <= 100) setLed(185,130,  0);    // Moderate high
-
-  else if (aqi <= 125) setLed(165, 70,  0);    // USG low
-  else if (aqi <= 150) setLed(210, 95,  0);    // USG high
-
-  else if (aqi <= 175) setLed(135,  0,  0);    // Unhealthy low
-  else if (aqi <= 200) setLed(185,  0,  0);    // Unhealthy high
-
-  else if (aqi <= 250) setLed(75,   0,105);    // Very unhealthy low
-  else if (aqi <= 300) setLed(120,  0,160);    // Very unhealthy high
-
-  else if (aqi <= 400) setLed(80,   0,  0);    // Hazardous low
-  else                 setLed(130,  0,  0);    // Hazardous high
+  if (aqi <= 50) {
+    setLed(0, 180, 0);
+  } else if (aqi <= 100) {
+    setLed(255, 180, 0);
+  } else if (aqi <= 150) {
+    setLed(255, 100, 0);
+  } else if (aqi <= 200) {
+    setLed(255, 0, 0);
+  } else if (aqi <= 300) {
+    setLed(140, 0, 255);
+  } else {
+    setLed(128, 0, 0);
+  }
 }
 
 void showApModeLed() {
-  if (previewMode) setLed(previewR, previewG, previewB);
-  else setLed(0, 0, 110);
+  if (previewMode) {
+    setLed(previewR, previewG, previewB);
+  } else {
+    setLed(0, 0, 180);
+  }
+}
+
+// ---------------------------
+// HTML page
+// ---------------------------
+String makePage(const String& msg = "") {
+  String checkedPersonal   = (cfg.wifiMode != "enterprise") ? "checked" : "";
+  String checkedEnterprise = (cfg.wifiMode == "enterprise") ? "checked" : "";
+
+  String page = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ESP32 IQAir Config</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 760px; margin: 20px auto; padding: 0 16px; background:#f5f7fb; }
+    .card { background:#fff; border-radius:14px; padding:20px; box-shadow:0 2px 10px rgba(0,0,0,.08); }
+    h1 { margin-top:0; font-size:24px; }
+    label { display:block; margin-top:12px; font-weight:600; }
+    input, select, button { font-size:16px; }
+    input[type="text"], input[type="password"], input[type="number"] {
+      width:100%; padding:10px; margin-top:6px; border:1px solid #ccc; border-radius:10px; box-sizing:border-box;
+    }
+    button {
+      margin-top:12px; padding:12px 18px; border:none; border-radius:12px;
+      background:#2563eb; color:#fff; cursor:pointer;
+    }
+    .btn2 { background:#0f766e; }
+    .btn3 { background:#7c3aed; }
+    .msg { margin:12px 0; padding:10px 12px; border-radius:10px; background:#eef6ff; color:#184b8a; }
+    .warn { background:#fff4e5; color:#8a5a00; }
+    .ok { background:#ecfdf5; color:#166534; }
+    .section { margin-top:20px; padding-top:12px; border-top:1px solid #eee; }
+    .radio-group { display:flex; gap:20px; margin-top:10px; }
+    .radio-group label { font-weight:normal; }
+    .small { font-size:13px; color:#666; }
+    .ssid-item {
+      padding:10px; border:1px solid #ddd; border-radius:10px; margin-top:8px; cursor:pointer;
+      background:#fafafa;
+    }
+    .ssid-item:hover { background:#eef6ff; }
+    .preview-box {
+      margin-top:10px; width:100%; height:42px; border-radius:12px; border:1px solid #ddd;
+      background: linear-gradient(90deg, #0000ff, #00ffff, #00ff00, #ffff00, #ff7f00, #ff0000);
+      opacity: 0.9;
+    }
+    .inline { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .value-badge {
+      padding:6px 10px; border-radius:999px; background:#eef2ff; display:inline-block; font-weight:700;
+    }
+    .grid2 {
+      display:grid;
+      grid-template-columns:1fr 1fr;
+      gap:12px;
+    }
+    @media (max-width:600px) {
+      .grid2 { grid-template-columns:1fr; }
+    }
+  </style>
+  <script>
+    function updateMode() {
+      const modeEl = document.querySelector('input[name="wifiMode"]:checked');
+      const mode = modeEl ? modeEl.value : 'personal';
+      const ent = document.getElementById('enterpriseFields');
+      ent.style.display = (mode === 'enterprise') ? 'block' : 'none';
+    }
+
+    async function scanSSID() {
+      const box = document.getElementById('scanResults');
+      box.innerHTML = '<div class="msg">กำลังสแกน Wi-Fi...</div>';
+      try {
+        const res = await fetch('/scan');
+        const data = await res.json();
+        if (!data.networks || data.networks.length === 0) {
+          box.innerHTML = '<div class="msg warn">ไม่พบ SSID</div>';
+          return;
+        }
+
+        let html = '';
+        data.networks.forEach(n => {
+          html += `<div class="ssid-item" onclick="pickSSID('${String(n.ssid).replace(/'/g, "\\'")}')">
+                    <b>${n.ssid}</b><br>
+                    RSSI: ${n.rssi} dBm | ${n.secure ? 'Secure' : 'Open'}
+                  </div>`;
+        });
+        box.innerHTML = html;
+      } catch (e) {
+        box.innerHTML = '<div class="msg warn">สแกนไม่สำเร็จ</div>';
+      }
+    }
+
+    function pickSSID(ssid) {
+      document.querySelector('input[name="ssid"]').value = ssid;
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    async function previewBrightness() {
+      const v = document.getElementById('brightness').value;
+      document.getElementById('brightnessValue').innerText = v + '%';
+      try {
+        await fetch('/previewBrightness?value=' + encodeURIComponent(v));
+      } catch(e) {}
+    }
+
+    function setLocationMessage(text, cls) {
+      const box = document.getElementById('locationMsg');
+      box.className = 'msg ' + (cls || '');
+      box.innerText = text;
+      box.style.display = 'block';
+    }
+
+    function usePhoneLocation() {
+      if (!navigator.geolocation) {
+        setLocationMessage('Browser ไม่รองรับ Geolocation กรุณากรอก Latitude/Longitude เอง', 'warn');
+        return;
+      }
+
+      setLocationMessage('กำลังอ่านตำแหน่งจากโทรศัพท์...', '');
+
+      navigator.geolocation.getCurrentPosition(
+        function(pos) {
+          const lat = pos.coords.latitude.toFixed(6);
+          const lon = pos.coords.longitude.toFixed(6);
+
+          document.getElementById('latitude').value = lat;
+          document.getElementById('longitude').value = lon;
+
+          setLocationMessage('ดึงตำแหน่งสำเร็จ: lat=' + lat + ', lon=' + lon, 'ok');
+        },
+        function(err) {
+          let msg = 'อ่านตำแหน่งไม่ได้';
+          if (err && err.message) msg += ': ' + err.message;
+          msg += ' กรุณากรอก Latitude/Longitude เอง';
+          setLocationMessage(msg, 'warn');
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 10000,
+          maximumAge: 60000
+        }
+      );
+    }
+
+    window.onload = function() {
+      updateMode();
+      previewBrightness();
+    };
+  </script>
+</head>
+<body>
+  <div class="card">
+    <h1>ESP32 IQAir Config</h1>
+)HTML";
+
+  if (msg.length()) {
+    page += "<div class='msg'>" + msg + "</div>";
+  }
+
+  page += "<div class='msg warn'>หลังบันทึกค่า อุปกรณ์จะลองเชื่อมต่อ Wi-Fi ใหม่ทันที และจะดึง AQI ทันทีเมื่อเชื่อมต่อสำเร็จ</div>";
+
+  page += R"HTML(
+    <form method="POST" action="/save">
+      <label>Wi-Fi Type</label>
+      <div class="radio-group">
+        <label><input type="radio" name="wifiMode" value="personal" )HTML";
+  page += checkedPersonal;
+  page += R"HTML( onclick="updateMode()"> WPA/WPA2 Personal</label>
+        <label><input type="radio" name="wifiMode" value="enterprise" )HTML";
+  page += checkedEnterprise;
+  page += R"HTML( onclick="updateMode()"> WPA2 Enterprise</label>
+      </div>
+
+      <div class="section">
+        <div class="inline">
+          <label style="margin:0;">SSID</label>
+          <button type="button" class="btn2" onclick="scanSSID()">Scan SSID</button>
+        </div>
+        <input name="ssid" value=")HTML" + htmlEscape(cfg.ssid) + R"HTML(">
+        <div id="scanResults"></div>
+
+        <label>Password</label>
+        <input name="password" type="password" value=")HTML" + htmlEscape(cfg.password) + R"HTML(">
+        <div class="small">สำหรับ Personal ใช้ช่องนี้เป็นรหัสผ่าน Wi-Fi ปกติ</div>
+      </div>
+
+      <div class="section" id="enterpriseFields">
+        <label>Identity</label>
+        <input name="identity" value=")HTML" + htmlEscape(cfg.identity) + R"HTML(">
+
+        <label>Username</label>
+        <input name="username" value=")HTML" + htmlEscape(cfg.username) + R"HTML(">
+
+        <label>Enterprise Password</label>
+        <input name="eapPassword" type="password" value=")HTML" + htmlEscape(cfg.eapPassword) + R"HTML(">
+        <div class="small">สำหรับ WPA2 Enterprise (PEAP)</div>
+      </div>
+
+      <div class="section">
+        <label>IQAir API Key</label>
+        <input name="apiKey" value=")HTML" + htmlEscape(cfg.apiKey) + R"HTML(">
+
+        <div class="inline">
+          <label style="margin:0;">Location</label>
+          <button type="button" class="btn3" onclick="usePhoneLocation()">Use phone location</button>
+        </div>
+
+        <div id="locationMsg" class="msg" style="display:none;"></div>
+
+        <div class="grid2">
+          <div>
+            <label>Latitude</label>
+            <input id="latitude" name="latitude" value=")HTML" + htmlEscape(cfg.latitude) + R"HTML(" placeholder="เช่น 13.7563">
+          </div>
+          <div>
+            <label>Longitude</label>
+            <input id="longitude" name="longitude" value=")HTML" + htmlEscape(cfg.longitude) + R"HTML(" placeholder="เช่น 100.5018">
+          </div>
+        </div>
+        <div class="small">กด Use phone location เพื่อดึงพิกัดอัตโนมัติ หรือกรอกเองได้หาก browser ไม่อนุญาต</div>
+      </div>
+
+      <div class="section">
+        <label>LED Brightness</label>
+        <div class="inline">
+          <input
+            id="brightness"
+            name="brightness"
+            type="range"
+            min="10"
+            max="100"
+            step="1"
+            value=")HTML" + String(cfg.brightnessPercent) + R"HTML("
+            oninput="previewBrightness()"
+            style="width:320px;"
+          >
+          <span id="brightnessValue" class="value-badge">)HTML" + String(cfg.brightnessPercent) + R"HTML(%
+          </span>
+        </div>
+        <div class="preview-box"></div>
+        <div class="small">ลากเพื่อปรับความสว่าง 10% ถึง 100% และ LED บนบอร์ดจะแสดงให้ดูทันที</div>
+      </div>
+
+      <button type="submit">Save & Connect</button>
+    </form>
+
+    <div class="section">
+      <div><b>AP SSID:</b> )HTML";
+  page += AP_SSID;
+  page += R"HTML(</div>
+      <div><b>AP IP:</b> 192.168.4.1</div>
+    </div>
+  </div>
+</body>
+</html>
+)HTML";
+
+  return page;
 }
 
 // ---------------------------
@@ -185,13 +477,10 @@ void showApModeLed() {
 // ---------------------------
 void loadConfig() {
   cfg.wifiMode = "personal";
-  cfg.apiUrl = DEFAULT_API_URL;
+  cfg.apiKey = "";
+  cfg.latitude = "";
+  cfg.longitude = "";
   cfg.brightnessPercent = 30;
-  cfg.ssid = "";
-  cfg.password = "";
-  cfg.identity = "";
-  cfg.username = "";
-  cfg.eapPassword = "";
 
   if (!prefs.begin("iqaircfg", true)) {
     Serial.println("NVS namespace 'iqaircfg' not found yet. Using defaults.");
@@ -204,7 +493,9 @@ void loadConfig() {
   cfg.identity          = prefs.getString("identity", "");
   cfg.username          = prefs.getString("username", "");
   cfg.eapPassword       = prefs.getString("eapPass", "");
-  cfg.apiUrl            = prefs.getString("apiUrl", DEFAULT_API_URL);
+  cfg.apiKey            = prefs.getString("apiKey", "");
+  cfg.latitude          = prefs.getString("lat", "");
+  cfg.longitude         = prefs.getString("lon", "");
   cfg.brightnessPercent = (uint8_t)prefs.getUChar("brightPct", 30);
 
   if (cfg.brightnessPercent < 10 || cfg.brightnessPercent > 100) {
@@ -226,14 +517,16 @@ void saveConfig() {
   prefs.putString("identity", cfg.identity);
   prefs.putString("username", cfg.username);
   prefs.putString("eapPass", cfg.eapPassword);
-  prefs.putString("apiUrl", cfg.apiUrl);
+  prefs.putString("apiKey", cfg.apiKey);
+  prefs.putString("lat", cfg.latitude);
+  prefs.putString("lon", cfg.longitude);
   prefs.putUChar("brightPct", cfg.brightnessPercent);
 
   prefs.end();
 }
 
 // ---------------------------
-// Wi-Fi
+// Wi-Fi connect
 // ---------------------------
 bool tryConnectWiFiOnce() {
   if (cfg.ssid.isEmpty()) {
@@ -282,22 +575,20 @@ bool tryConnectWiFiOnce() {
 
 bool fetchIQAirAndUpdateLed();
 
-bool connectWiFiWithRetries(bool fetchAfterConnect = true) {
+bool connectWiFiWithRetries() {
   for (uint8_t i = 0; i < WIFI_MAX_ATTEMPTS; i++) {
     Serial.printf("WiFi attempt %u/%u\n", i + 1, WIFI_MAX_ATTEMPTS);
-
     if (tryConnectWiFiOnce()) {
       wifiConnected = true;
       apMode = false;
       previewMode = false;
       blinkColor(0, 180, 0, 2);
 
-      if (fetchAfterConnect) {
-        fetchIQAirAndUpdateLed();
-      }
+      fetchIQAirAndUpdateLed();
+      lastPollMs = millis();
+
       return true;
     }
-
     blinkColor(255, 0, 0, 1);
     delay(500);
   }
@@ -307,223 +598,8 @@ bool connectWiFiWithRetries(bool fetchAfterConnect = true) {
 }
 
 // ---------------------------
-// Sleep
+// AP + web config
 // ---------------------------
-void disconnectRadios() {
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_OFF);
-  btStop();
-  delay(100);
-}
-
-void goToDeepSleep() {
-  Serial.println("Entering deep sleep for 10 minutes...");
-
-  disconnectRadios();
-
-  // ถ้าต้องการให้ LED ดับก่อน sleep ให้เปิดบรรทัดนี้
-  // ledOff();
-
-  esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
-  Serial.flush();
-  esp_deep_sleep_start();
-}
-
-// ---------------------------
-// Web UI
-// ---------------------------
-String makePage(const String& msg = "") {
-  String checkedPersonal   = (cfg.wifiMode != "enterprise") ? "checked" : "";
-  String checkedEnterprise = (cfg.wifiMode == "enterprise") ? "checked" : "";
-
-  String remainText = "";
-  if (inConfigWindow) {
-    long remain = (long)(CONFIG_WINDOW_MS - (millis() - awakeStartMs));
-    if (remain < 0) remain = 0;
-    remainText = "<div class='msg warn'>หมดเวลาตั้งค่าและจะเข้า sleep ในอีก " + String(remain / 1000) + " วินาที</div>";
-  }
-
-  String page = R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ESP32 IQAir Config</title>
-  <style>
-    body { font-family: Arial, sans-serif; max-width: 760px; margin: 20px auto; padding: 0 16px; background:#f5f7fb; }
-    .card { background:#fff; border-radius:14px; padding:20px; box-shadow:0 2px 10px rgba(0,0,0,.08); }
-    h1 { margin-top:0; font-size:24px; }
-    label { display:block; margin-top:12px; font-weight:600; }
-    input, select, button { font-size:16px; }
-    input[type="text"], input[type="password"] {
-      width:100%; padding:10px; margin-top:6px; border:1px solid #ccc; border-radius:10px; box-sizing:border-box;
-    }
-    button {
-      margin-top:12px; padding:12px 18px; border:none; border-radius:12px;
-      background:#2563eb; color:#fff; cursor:pointer;
-    }
-    .btn2 { background:#0f766e; }
-    .msg { margin:12px 0; padding:10px 12px; border-radius:10px; background:#eef6ff; color:#184b8a; }
-    .warn { background:#fff4e5; color:#8a5a00; }
-    .section { margin-top:20px; padding-top:12px; border-top:1px solid #eee; }
-    .radio-group { display:flex; gap:20px; margin-top:10px; }
-    .radio-group label { font-weight:normal; }
-    .small { font-size:13px; color:#666; }
-    .ssid-item {
-      padding:10px; border:1px solid #ddd; border-radius:10px; margin-top:8px; cursor:pointer;
-      background:#fafafa;
-    }
-    .ssid-item:hover { background:#eef6ff; }
-    .preview-box {
-      margin-top:10px; width:100%; height:42px; border-radius:12px; border:1px solid #ddd;
-      background: linear-gradient(90deg, #003300, #00aa00, #b48a00, #ffd000, #cc5500, #ff7f00, #7a0000, #d00000, #5a007a, #a000d0, #500000, #900000);
-      opacity: 0.95;
-    }
-    .inline { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-    .value-badge {
-      padding:6px 10px; border-radius:999px; background:#eef2ff; display:inline-block; font-weight:700;
-    }
-  </style>
-  <script>
-    function updateMode() {
-      const modeEl = document.querySelector('input[name="wifiMode"]:checked');
-      const mode = modeEl ? modeEl.value : 'personal';
-      const ent = document.getElementById('enterpriseFields');
-      ent.style.display = (mode === 'enterprise') ? 'block' : 'none';
-    }
-
-    async function scanSSID() {
-      const box = document.getElementById('scanResults');
-      box.innerHTML = '<div class="msg">กำลังสแกน Wi-Fi...</div>';
-      try {
-        const res = await fetch('/scan');
-        const data = await res.json();
-        if (!data.networks || data.networks.length === 0) {
-          box.innerHTML = '<div class="msg warn">ไม่พบ SSID</div>';
-          return;
-        }
-
-        let html = '';
-        data.networks.forEach(n => {
-          html += `<div class="ssid-item" onclick="pickSSID('${String(n.ssid).replace(/'/g, "\\'")}')">
-                    <b>${n.ssid}</b><br>
-                    RSSI: ${n.rssi} dBm | ${n.secure ? 'Secure' : 'Open'}
-                  </div>`;
-        });
-        box.innerHTML = html;
-      } catch (e) {
-        box.innerHTML = '<div class="msg warn">สแกนไม่สำเร็จ</div>';
-      }
-    }
-
-    function pickSSID(ssid) {
-      document.querySelector('input[name="ssid"]').value = ssid;
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
-
-    async function previewBrightness() {
-      const v = document.getElementById('brightness').value;
-      document.getElementById('brightnessValue').innerText = v + '%';
-      try {
-        await fetch('/previewBrightness?value=' + encodeURIComponent(v));
-      } catch(e) {}
-    }
-
-    window.onload = function() {
-      updateMode();
-      previewBrightness();
-    };
-  </script>
-</head>
-<body>
-  <div class="card">
-    <h1>ESP32 IQAir Config</h1>
-)HTML";
-
-  if (msg.length()) page += "<div class='msg'>" + msg + "</div>";
-  page += remainText;
-  page += "<div class='msg warn'>โหมดตั้งค่าจะเปิดเมื่อเปิดเครื่องแล้วต่อ Wi-Fi เดิมไม่ได้ โดยจะรอ config 5 นาที จากนั้นเข้า deep sleep</div>";
-
-  page += R"HTML(
-    <form method="POST" action="/save">
-      <label>Wi-Fi Type</label>
-      <div class="radio-group">
-        <label><input type="radio" name="wifiMode" value="personal" )HTML";
-  page += checkedPersonal;
-  page += R"HTML( onclick="updateMode()"> WPA/WPA2 Personal</label>
-        <label><input type="radio" name="wifiMode" value="enterprise" )HTML";
-  page += checkedEnterprise;
-  page += R"HTML( onclick="updateMode()"> WPA2 Enterprise</label>
-      </div>
-
-      <div class="section">
-        <div class="inline">
-          <label style="margin:0;">SSID</label>
-          <button type="button" class="btn2" onclick="scanSSID()">Scan SSID</button>
-        </div>
-        <input name="ssid" value=")HTML" + htmlEscape(cfg.ssid) + R"HTML(">
-        <div id="scanResults"></div>
-
-        <label>Password</label>
-        <input name="password" type="password" value=")HTML" + htmlEscape(cfg.password) + R"HTML(">
-        <div class="small">สำหรับ Personal ใช้ช่องนี้เป็นรหัสผ่าน Wi-Fi ปกติ</div>
-      </div>
-
-      <div class="section" id="enterpriseFields">
-        <label>Identity</label>
-        <input name="identity" value=")HTML" + htmlEscape(cfg.identity) + R"HTML(">
-
-        <label>Username</label>
-        <input name="username" value=")HTML" + htmlEscape(cfg.username) + R"HTML(">
-
-        <label>Enterprise Password</label>
-        <input name="eapPassword" type="password" value=")HTML" + htmlEscape(cfg.eapPassword) + R"HTML(">
-        <div class="small">สำหรับ WPA2 Enterprise (PEAP)</div>
-      </div>
-
-      <div class="section">
-        <label>IQAir API URL</label>
-        <input name="apiUrl" value=")HTML" + htmlEscape(cfg.apiUrl) + R"HTML(">
-      </div>
-
-      <div class="section">
-        <label>LED Brightness</label>
-        <div class="inline">
-          <input
-            id="brightness"
-            name="brightness"
-            type="range"
-            min="10"
-            max="100"
-            step="1"
-            value=")HTML" + String(cfg.brightnessPercent) + R"HTML("
-            oninput="previewBrightness()"
-            style="width:320px;"
-          >
-          <span id="brightnessValue" class="value-badge">)HTML" + String(cfg.brightnessPercent) + R"HTML(%</span>
-        </div>
-        <div class="preview-box"></div>
-        <div class="small">ปรับความสว่าง 10% ถึง 100%</div>
-      </div>
-
-      <button type="submit">Save & Connect</button>
-    </form>
-
-    <div class="section">
-      <div><b>AP SSID:</b> )HTML";
-  page += AP_SSID;
-  page += R"HTML(</div>
-      <div><b>AP IP:</b> 192.168.4.1</div>
-    </div>
-  </div>
-</body>
-</html>
-)HTML";
-
-  return page;
-}
-
 void startAPMode() {
   WiFi.disconnect(true, true);
   delay(200);
@@ -551,7 +627,9 @@ void handleStatus() {
   json += "\"wifiConnected\":" + String(wifiConnected ? "true" : "false") + ",";
   json += "\"ip\":\"" + (wifiConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "\",";
   json += "\"ssid\":\"" + htmlEscape(cfg.ssid) + "\",";
-  json += "\"apiUrl\":\"" + htmlEscape(cfg.apiUrl) + "\",";
+  json += "\"apiKey\":\"" + htmlEscape(cfg.apiKey) + "\",";
+  json += "\"latitude\":\"" + htmlEscape(cfg.latitude) + "\",";
+  json += "\"longitude\":\"" + htmlEscape(cfg.longitude) + "\",";
   json += "\"brightness\":" + String(cfg.brightnessPercent);
   json += "}";
   server.send(200, "application/json", json);
@@ -587,22 +665,32 @@ void handlePreviewBrightness() {
 
   cfg.brightnessPercent = (uint8_t)v;
   previewMode = true;
+
   previewR = 0;
-  previewG = 60;
-  previewB = 170;
+  previewG = 120;
+  previewB = 255;
   showApModeLed();
 
   server.send(200, "text/plain", "OK");
 }
 
+String trimmedArg(const char* name) {
+  String v = server.arg(name);
+  v.trim();
+  return v;
+}
+
 void handleSave() {
-  cfg.wifiMode    = server.arg("wifiMode");
-  cfg.ssid        = server.arg("ssid");
-  cfg.password    = server.arg("password");
-  cfg.identity    = server.arg("identity");
-  cfg.username    = server.arg("username");
-  cfg.eapPassword = server.arg("eapPassword");
-  cfg.apiUrl      = server.arg("apiUrl");
+  cfg.wifiMode    = trimmedArg("wifiMode");
+  cfg.ssid        = trimmedArg("ssid");
+  cfg.password    = trimmedArg("password");
+  cfg.identity    = trimmedArg("identity");
+  cfg.username    = trimmedArg("username");
+  cfg.eapPassword = trimmedArg("eapPassword");
+
+  cfg.apiKey      = trimmedArg("apiKey");
+  cfg.latitude    = trimmedArg("latitude");
+  cfg.longitude   = trimmedArg("longitude");
 
   int bright = server.arg("brightness").toInt();
   if (bright < 10) bright = 10;
@@ -610,27 +698,18 @@ void handleSave() {
   cfg.brightnessPercent = (uint8_t)bright;
 
   if (cfg.wifiMode != "enterprise") cfg.wifiMode = "personal";
-  if (cfg.apiUrl.isEmpty()) cfg.apiUrl = DEFAULT_API_URL;
 
   saveConfig();
 
   server.send(200, "text/html; charset=utf-8",
-              makePage("บันทึกค่าแล้ว กำลังเชื่อมต่อใหม่และดึง AQI ทันที..."));
+              makePage("บันทึกค่าแล้ว กำลังลองเชื่อมต่อ Wi-Fi ใหม่ และจะดึง AQI ทันทีเมื่อเชื่อมต่อสำเร็จ..."));
 
-  delay(500);
+  delay(800);
 
-  if (connectWiFiWithRetries(true)) {
-    Serial.println("Reconnected after save.");
-
-    unsigned long elapsed = millis() - awakeStartMs;
-    while (elapsed < CONFIG_WINDOW_MS) {
-      delay(50);
-      elapsed = millis() - awakeStartMs;
-    }
-
-    goToDeepSleep();
+  if (connectWiFiWithRetries()) {
+    Serial.println("Reconnected after saving config.");
   } else {
-    Serial.println("Reconnect failed, stay in AP mode.");
+    Serial.println("Reconnect failed, return to AP mode.");
     startAPMode();
   }
 }
@@ -646,7 +725,7 @@ void setupWebServer() {
 }
 
 // ---------------------------
-// IQAir
+// IQAir polling
 // ---------------------------
 bool fetchIQAirAndUpdateLed() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -654,13 +733,26 @@ bool fetchIQAirAndUpdateLed() {
     return false;
   }
 
+  float lat, lon;
+  if (cfg.apiKey.isEmpty()) {
+    Serial.println("IQAir API key is empty.");
+    blinkColor(255, 0, 0, 2);
+    return false;
+  }
+  if (!isValidLatLon(cfg.latitude, cfg.longitude, lat, lon)) {
+    Serial.println("Latitude/Longitude invalid.");
+    blinkColor(255, 0, 0, 2);
+    return false;
+  }
+
+  String url = buildIQAirUrl();
   HTTPClient http;
   http.setTimeout(15000);
 
   Serial.print("GET: ");
-  Serial.println(cfg.apiUrl);
+  Serial.println(url);
 
-  if (!http.begin(cfg.apiUrl)) {
+  if (!http.begin(url)) {
     Serial.println("HTTP begin failed.");
     blinkColor(255, 0, 0, 2);
     return false;
@@ -677,6 +769,8 @@ bool fetchIQAirAndUpdateLed() {
   Serial.printf("HTTP code: %d\n", httpCode);
 
   if (httpCode != HTTP_CODE_OK) {
+    String errBody = http.getString();
+    Serial.println(errBody);
     http.end();
     blinkColor(255, 0, 0, 2);
     return false;
@@ -694,106 +788,44 @@ bool fetchIQAirAndUpdateLed() {
     return false;
   }
 
-  int aqius = doc["current"]["aqius"] | -1;
-  float pm25Conc = doc["current"]["pm25"]["conc"] | -1.0;
-  const char* ts = doc["current"]["ts"] | "";
-
-  if (aqius < 0) {
-    Serial.println("current.aqius field missing.");
+  const char* status = doc["status"] | "";
+  if (String(status) != "success") {
+    Serial.print("API status not success: ");
+    Serial.println(status);
     blinkColor(255, 0, 0, 2);
     return false;
   }
 
-  Serial.printf("AQI(US): %d, PM2.5 conc: %.1f, ts: %s\n", aqius, pm25Conc, ts);
-  showAQIColorDetailed(aqius);
+  int aqius = doc["data"]["current"]["pollution"]["aqius"] | -1;
+  int aqicn = doc["data"]["current"]["pollution"]["aqicn"] | -1;
+  const char* mainus = doc["data"]["current"]["pollution"]["mainus"] | "";
+  const char* ts = doc["data"]["current"]["pollution"]["ts"] | "";
+  const char* city = doc["data"]["city"] | "";
+  const char* state = doc["data"]["state"] | "";
+  const char* country = doc["data"]["country"] | "";
+
+  if (aqius < 0) {
+    Serial.println("data.current.pollution.aqius field missing.");
+    blinkColor(255, 0, 0, 2);
+    return false;
+  }
+
+  Serial.printf("Location: %s, %s, %s\n", city, state, country);
+  Serial.printf("AQI(US): %d, AQI(CN): %d, mainus: %s, ts: %s\n", aqius, aqicn, mainus, ts);
+
+  showAQIColor(aqius);
   return true;
 }
 
-// ---------------------------
-// Wake logic
-// ---------------------------
-bool isTimerWake() {
-  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  return (cause == ESP_SLEEP_WAKEUP_TIMER);
-}
+void ensureWiFiAlive() {
+  if (apMode) return;
+  if (WiFi.status() == WL_CONNECTED) return;
 
-void runFirstBootWindow() {
-  Serial.println("First boot / external reset mode");
-  inConfigWindow = false;
-  awakeStartMs = millis();
-
-  if (cfg.ssid.isEmpty()) {
-    Serial.println("No saved SSID. Enter AP mode for config.");
-    inConfigWindow = true;
-    awakeStartMs = millis();
+  Serial.println("WiFi lost. Reconnecting...");
+  if (!connectWiFiWithRetries()) {
+    Serial.println("Reconnect failed. Switching to AP mode.");
     startAPMode();
-    setupWebServer();
-
-    while (millis() - awakeStartMs < CONFIG_WINDOW_MS) {
-      server.handleClient();
-      delay(10);
-    }
-
-    goToDeepSleep();
-    return;
   }
-
-  bool ok = connectWiFiWithRetries(true);
-
-  if (!ok) {
-    Serial.println("Default WiFi connect failed. Enter AP mode for config.");
-    inConfigWindow = true;
-    awakeStartMs = millis();
-    startAPMode();
-    setupWebServer();
-
-    while (millis() - awakeStartMs < CONFIG_WINDOW_MS) {
-      server.handleClient();
-      delay(10);
-    }
-
-    goToDeepSleep();
-    return;
-  }
-
-  Serial.println("Default WiFi connected. Stay awake 5 minutes before sleep.");
-  setupWebServer();
-  unsigned long waitStart = millis();
-  while (millis() - waitStart < CONFIG_WINDOW_MS) {
-    server.handleClient();
-    delay(10);
-  }
-
-  goToDeepSleep();
-}
-
-void runTimerWakeCycle() {
-  Serial.println("Wake from deep sleep by timer");
-
-  if (cfg.ssid.isEmpty()) {
-    Serial.println("No saved SSID. Sleep again.");
-    blinkColor(255, 80, 0, 2);
-    delay(1500);
-    goToDeepSleep();
-    return;
-  }
-
-  bool ok = connectWiFiWithRetries(true);
-
-  if (!ok) {
-    Serial.println("WiFi reconnect failed after wake. Sleep again.");
-    blinkColor(255, 0, 0, 2);
-    delay(1500);
-    goToDeepSleep();
-    return;
-  }
-
-  unsigned long startMs = millis();
-  while (millis() - startMs < WAKE_DISPLAY_MS) {
-    delay(50);
-  }
-
-  goToDeepSleep();
 }
 
 // ---------------------------
@@ -803,23 +835,39 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  rtcBootCount++;
-
   pixel.begin();
   loadConfig();
   applyBrightness();
   ledOff();
 
-  Serial.printf("RTC boot count: %lu\n", (unsigned long)rtcBootCount);
-  Serial.printf("Wakeup cause: %d\n", (int)esp_sleep_get_wakeup_cause());
-
-  if (isTimerWake()) {
-    runTimerWakeCycle();
+  Serial.println("Boot: try saved WiFi first.");
+  if (connectWiFiWithRetries()) {
+    Serial.println("Connected on boot.");
   } else {
-    runFirstBootWindow();
+    Serial.println("Boot WiFi failed. Enter AP mode.");
+    startAPMode();
   }
+
+  setupWebServer();
 }
 
 void loop() {
-  delay(1000);
+  server.handleClient();
+
+  if (apMode) {
+    delay(10);
+    return;
+  }
+
+  ensureWiFiAlive();
+
+  if (!apMode && WiFi.status() == WL_CONNECTED) {
+    unsigned long now = millis();
+    if (now - lastPollMs >= POLL_INTERVAL_MS) {
+      lastPollMs = now;
+      fetchIQAirAndUpdateLed();
+    }
+  }
+
+  delay(10);
 }
