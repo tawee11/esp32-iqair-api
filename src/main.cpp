@@ -38,7 +38,6 @@ static const int LED_PIN = 48;
 // ---------------------------
 static const char* AP_SSID = "ESP32-IQAir-Config";
 static const char* AP_PASS = "12345678";
-static const char* DEFAULT_API_URL = "";
 
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint8_t  WIFI_MAX_ATTEMPTS = 5;
