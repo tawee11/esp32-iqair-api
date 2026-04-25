@@ -18,3 +18,5 @@ Thumbs.db
 
 # Secret files
 src/secrets.h
+#Folder for backup files
+backup/
