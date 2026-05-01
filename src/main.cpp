@@ -1,6 +1,6 @@
 /*
   ESP32-S3 YD-ESP32-23 V1.3
-  IQAir AQI by lat/lon -> RGB LED
+  IQAir AQI -> RGB LED
 
   Features
   - Boot: try saved Wi-Fi first
@@ -8,14 +8,11 @@
   - Config page allows:
       * WPA/WPA2 Personal
       * WPA2 Enterprise (PEAP)
-      * IQAir API Key
-      * Latitude / Longitude
-      * Use phone location (browser geolocation)
-      * Fallback manual lat/lon
+      * API URL edit
       * Scan SSID
       * LED brightness slider 10-100%
   - Poll IQAir every 10 minutes
-  - Use AQI from: data.current.pollution.aqius
+  - Use current.aqius
   - After Wi-Fi connected, fetch API immediately
 
   Required libraries:
@@ -30,6 +27,9 @@
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
 
+
+// Some board variants define RGB_BUILTIN incorrectly.
+// YD-ESP32-23 commonly uses GPIO48.
 static const int LED_PIN = 48;
 
 // ---------------------------
@@ -37,11 +37,10 @@ static const int LED_PIN = 48;
 // ---------------------------
 static const char* AP_SSID = "ESP32-IQAir-Config";
 static const char* AP_PASS = "12345678";
-static const char* IQAIR_BASE_URL = "http://api.airvisual.com/v2/nearest_city";
 
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint8_t  WIFI_MAX_ATTEMPTS = 3;
-static const uint32_t POLL_INTERVAL_MS = 10UL * 60UL * 1000UL;
+static const uint32_t POLL_INTERVAL_MS = 10UL * 60UL * 1000UL; // 10 นาที
 
 // ---------------------------
 // Global objects
@@ -63,11 +62,7 @@ struct AppConfig {
   String username;
   String eapPassword;
 
-  // IQAir by lat/lon
-  String apiKey;
-  String latitude;
-  String longitude;
-
+  String apiUrl;
   uint8_t brightnessPercent; // 10..100
 };
 
@@ -93,44 +88,6 @@ String htmlEscape(const String& s) {
   out.replace(">", "&gt;");
   out.replace("\"", "&quot;");
   return out;
-}
-
-String urlEncodeSimple(const String& s) {
-  String out;
-  char hex[4];
-  for (size_t i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
-      out += c;
-    } else {
-      snprintf(hex, sizeof(hex), "%%%02X", (unsigned char)c);
-      out += hex;
-    }
-  }
-  return out;
-}
-
-bool isValidLatLon(const String& latStr, const String& lonStr, float &lat, float &lon) {
-  if (latStr.isEmpty() || lonStr.isEmpty()) return false;
-
-  lat = latStr.toFloat();
-  lon = lonStr.toFloat();
-
-  bool latLooksZero = (lat == 0.0f && latStr != "0" && latStr != "0.0" && latStr != "0.00");
-  bool lonLooksZero = (lon == 0.0f && lonStr != "0" && lonStr != "0.0" && lonStr != "0.00");
-  if (latLooksZero || lonLooksZero) return false;
-
-  if (lat < -90.0f || lat > 90.0f) return false;
-  if (lon < -180.0f || lon > 180.0f) return false;
-
-  return true;
-}
-
-String buildIQAirUrl() {
-  return String(IQAIR_BASE_URL)
-       + "?lat=" + urlEncodeSimple(cfg.latitude)
-       + "&lon=" + urlEncodeSimple(cfg.longitude)
-       + "&key=" + urlEncodeSimple(cfg.apiKey);
 }
 
 uint8_t percentToNeoBrightness(uint8_t percent) {
@@ -187,21 +144,26 @@ void blinkColor(uint8_t r, uint8_t g, uint8_t b, int times = 2, int onMs = 180, 
   }
 }
 
+// IQAir style AQI color mapping (US AQI)
 void showAQIColor(int aqi) {
   previewMode = false;
 
-  if (aqi <= 50) {
+  if (aqi <= 50) {          // Good
     setLed(0, 180, 0);
-  } else if (aqi <= 100) {
-    setLed(255, 180, 0);
-  } else if (aqi <= 150) {
+  } else if (aqi <= 80) {  
+    setLed(180, 255, 0); 
+  } else if (aqi <= 100) {  // Moderate
+    setLed(220, 255, 0); 
+  } else if (aqi <= 120) {  // Moderate
+    setLed(255, 180, 0); 
+  } else if (aqi <= 150) {  // Unhealthy for Sensitive Groups
     setLed(255, 100, 0);
-  } else if (aqi <= 200) {
+  } else if (aqi <= 200) {  // Unhealthy
     setLed(255, 0, 0);
-  } else if (aqi <= 300) {
+  } else if (aqi <= 300) {  // Very Unhealthy
     setLed(140, 0, 255);
-  } else {
-    setLed(128, 0, 0);
+  } else {                  // Hazardous
+    setLed(0, 0, 255);
   }
 }
 
@@ -209,7 +171,7 @@ void showApModeLed() {
   if (previewMode) {
     setLed(previewR, previewG, previewB);
   } else {
-    setLed(0, 0, 180);
+    setLed(0, 0, 180); // blue in AP mode
   }
 }
 
@@ -233,7 +195,7 @@ String makePage(const String& msg = "") {
     h1 { margin-top:0; font-size:24px; }
     label { display:block; margin-top:12px; font-weight:600; }
     input, select, button { font-size:16px; }
-    input[type="text"], input[type="password"], input[type="number"] {
+    input[type="text"], input[type="password"] {
       width:100%; padding:10px; margin-top:6px; border:1px solid #ccc; border-radius:10px; box-sizing:border-box;
     }
     button {
@@ -241,10 +203,8 @@ String makePage(const String& msg = "") {
       background:#2563eb; color:#fff; cursor:pointer;
     }
     .btn2 { background:#0f766e; }
-    .btn3 { background:#7c3aed; }
     .msg { margin:12px 0; padding:10px 12px; border-radius:10px; background:#eef6ff; color:#184b8a; }
     .warn { background:#fff4e5; color:#8a5a00; }
-    .ok { background:#ecfdf5; color:#166534; }
     .section { margin-top:20px; padding-top:12px; border-top:1px solid #eee; }
     .radio-group { display:flex; gap:20px; margin-top:10px; }
     .radio-group label { font-weight:normal; }
@@ -254,6 +214,7 @@ String makePage(const String& msg = "") {
       background:#fafafa;
     }
     .ssid-item:hover { background:#eef6ff; }
+    .range-wrap { margin-top:10px; }
     .preview-box {
       margin-top:10px; width:100%; height:42px; border-radius:12px; border:1px solid #ddd;
       background: linear-gradient(90deg, #0000ff, #00ffff, #00ff00, #ffff00, #ff7f00, #ff0000);
@@ -262,14 +223,6 @@ String makePage(const String& msg = "") {
     .inline { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     .value-badge {
       padding:6px 10px; border-radius:999px; background:#eef2ff; display:inline-block; font-weight:700;
-    }
-    .grid2 {
-      display:grid;
-      grid-template-columns:1fr 1fr;
-      gap:12px;
-    }
-    @media (max-width:600px) {
-      .grid2 { grid-template-columns:1fr; }
     }
   </style>
   <script>
@@ -317,45 +270,6 @@ String makePage(const String& msg = "") {
       } catch(e) {}
     }
 
-    function setLocationMessage(text, cls) {
-      const box = document.getElementById('locationMsg');
-      box.className = 'msg ' + (cls || '');
-      box.innerText = text;
-      box.style.display = 'block';
-    }
-
-    function usePhoneLocation() {
-      if (!navigator.geolocation) {
-        setLocationMessage('Browser ไม่รองรับ Geolocation กรุณากรอก Latitude/Longitude เอง', 'warn');
-        return;
-      }
-
-      setLocationMessage('กำลังอ่านตำแหน่งจากโทรศัพท์...', '');
-
-      navigator.geolocation.getCurrentPosition(
-        function(pos) {
-          const lat = pos.coords.latitude.toFixed(6);
-          const lon = pos.coords.longitude.toFixed(6);
-
-          document.getElementById('latitude').value = lat;
-          document.getElementById('longitude').value = lon;
-
-          setLocationMessage('ดึงตำแหน่งสำเร็จ: lat=' + lat + ', lon=' + lon, 'ok');
-        },
-        function(err) {
-          let msg = 'อ่านตำแหน่งไม่ได้';
-          if (err && err.message) msg += ': ' + err.message;
-          msg += ' กรุณากรอก Latitude/Longitude เอง';
-          setLocationMessage(msg, 'warn');
-        },
-        {
-          enableHighAccuracy: true,
-          timeout: 10000,
-          maximumAge: 60000
-        }
-      );
-    }
-
     window.onload = function() {
       updateMode();
       previewBrightness();
@@ -371,7 +285,7 @@ String makePage(const String& msg = "") {
     page += "<div class='msg'>" + msg + "</div>";
   }
 
-  page += "<div class='msg warn'>หลังบันทึกค่า อุปกรณ์จะลองเชื่อมต่อ Wi-Fi ใหม่ทันที และจะดึง AQI ทันทีเมื่อเชื่อมต่อสำเร็จ</div>";
+  page += "<div class='msg warn'>หลังบันทึกค่า อุปกรณ์จะลองเชื่อมต่อ Wi-Fi ใหม่ทันที และจะดึง API ทันทีเมื่อเชื่อมต่อสำเร็จ</div>";
 
   page += R"HTML(
     <form method="POST" action="/save">
@@ -411,27 +325,8 @@ String makePage(const String& msg = "") {
       </div>
 
       <div class="section">
-        <label>IQAir API Key</label>
-        <input name="apiKey" value=")HTML" + htmlEscape(cfg.apiKey) + R"HTML(">
-
-        <div class="inline">
-          <label style="margin:0;">Location</label>
-          <button type="button" class="btn3" onclick="usePhoneLocation()">Use phone location</button>
-        </div>
-
-        <div id="locationMsg" class="msg" style="display:none;"></div>
-
-        <div class="grid2">
-          <div>
-            <label>Latitude</label>
-            <input id="latitude" name="latitude" value=")HTML" + htmlEscape(cfg.latitude) + R"HTML(" placeholder="เช่น 13.7563">
-          </div>
-          <div>
-            <label>Longitude</label>
-            <input id="longitude" name="longitude" value=")HTML" + htmlEscape(cfg.longitude) + R"HTML(" placeholder="เช่น 100.5018">
-          </div>
-        </div>
-        <div class="small">กด Use phone location เพื่อดึงพิกัดอัตโนมัติ หรือกรอกเองได้หาก browser ไม่อนุญาต</div>
+        <label>IQAir API URL</label>
+        <input name="apiUrl" value=")HTML" + htmlEscape(cfg.apiUrl) + R"HTML(">
       </div>
 
       <div class="section">
@@ -477,9 +372,7 @@ String makePage(const String& msg = "") {
 // ---------------------------
 void loadConfig() {
   cfg.wifiMode = "personal";
-  cfg.apiKey = "";
-  cfg.latitude = "";
-  cfg.longitude = "";
+  cfg.apiUrl = DEFAULT_API_URL;
   cfg.brightnessPercent = 30;
 
   if (!prefs.begin("iqaircfg", true)) {
@@ -487,15 +380,13 @@ void loadConfig() {
     return;
   }
 
-  cfg.wifiMode          = prefs.getString("wifiMode", "personal");
-  cfg.ssid              = prefs.getString("ssid", "");
-  cfg.password          = prefs.getString("password", "");
-  cfg.identity          = prefs.getString("identity", "");
-  cfg.username          = prefs.getString("username", "");
-  cfg.eapPassword       = prefs.getString("eapPass", "");
-  cfg.apiKey            = prefs.getString("apiKey", "");
-  cfg.latitude          = prefs.getString("lat", "");
-  cfg.longitude         = prefs.getString("lon", "");
+  cfg.wifiMode         = prefs.getString("wifiMode", "personal");
+  cfg.ssid             = prefs.getString("ssid", "");
+  cfg.password         = prefs.getString("password", "");
+  cfg.identity         = prefs.getString("identity", "");
+  cfg.username         = prefs.getString("username", "");
+  cfg.eapPassword      = prefs.getString("eapPass", "");
+  cfg.apiUrl           = prefs.getString("apiUrl", DEFAULT_API_URL);
   cfg.brightnessPercent = (uint8_t)prefs.getUChar("brightPct", 30);
 
   if (cfg.brightnessPercent < 10 || cfg.brightnessPercent > 100) {
@@ -517,9 +408,7 @@ void saveConfig() {
   prefs.putString("identity", cfg.identity);
   prefs.putString("username", cfg.username);
   prefs.putString("eapPass", cfg.eapPassword);
-  prefs.putString("apiKey", cfg.apiKey);
-  prefs.putString("lat", cfg.latitude);
-  prefs.putString("lon", cfg.longitude);
+  prefs.putString("apiUrl", cfg.apiUrl);
   prefs.putUChar("brightPct", cfg.brightnessPercent);
 
   prefs.end();
@@ -584,6 +473,7 @@ bool connectWiFiWithRetries() {
       previewMode = false;
       blinkColor(0, 180, 0, 2);
 
+      // หลัง connect สำเร็จ ให้เรียก API ทันทีเสมอ
       fetchIQAirAndUpdateLed();
       lastPollMs = millis();
 
@@ -627,9 +517,7 @@ void handleStatus() {
   json += "\"wifiConnected\":" + String(wifiConnected ? "true" : "false") + ",";
   json += "\"ip\":\"" + (wifiConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "\",";
   json += "\"ssid\":\"" + htmlEscape(cfg.ssid) + "\",";
-  json += "\"apiKey\":\"" + htmlEscape(cfg.apiKey) + "\",";
-  json += "\"latitude\":\"" + htmlEscape(cfg.latitude) + "\",";
-  json += "\"longitude\":\"" + htmlEscape(cfg.longitude) + "\",";
+  json += "\"apiUrl\":\"" + htmlEscape(cfg.apiUrl) + "\",";
   json += "\"brightness\":" + String(cfg.brightnessPercent);
   json += "}";
   server.send(200, "application/json", json);
@@ -666,6 +554,7 @@ void handlePreviewBrightness() {
   cfg.brightnessPercent = (uint8_t)v;
   previewMode = true;
 
+  // preview ด้วยสีฟ้า
   previewR = 0;
   previewG = 120;
   previewB = 255;
@@ -674,23 +563,14 @@ void handlePreviewBrightness() {
   server.send(200, "text/plain", "OK");
 }
 
-String trimmedArg(const char* name) {
-  String v = server.arg(name);
-  v.trim();
-  return v;
-}
-
 void handleSave() {
-  cfg.wifiMode    = trimmedArg("wifiMode");
-  cfg.ssid        = trimmedArg("ssid");
-  cfg.password    = trimmedArg("password");
-  cfg.identity    = trimmedArg("identity");
-  cfg.username    = trimmedArg("username");
-  cfg.eapPassword = trimmedArg("eapPassword");
-
-  cfg.apiKey      = trimmedArg("apiKey");
-  cfg.latitude    = trimmedArg("latitude");
-  cfg.longitude   = trimmedArg("longitude");
+  cfg.wifiMode    = server.arg("wifiMode");
+  cfg.ssid        = server.arg("ssid");
+  cfg.password    = server.arg("password");
+  cfg.identity    = server.arg("identity");
+  cfg.username    = server.arg("username");
+  cfg.eapPassword = server.arg("eapPassword");
+  cfg.apiUrl      = server.arg("apiUrl");
 
   int bright = server.arg("brightness").toInt();
   if (bright < 10) bright = 10;
@@ -698,6 +578,7 @@ void handleSave() {
   cfg.brightnessPercent = (uint8_t)bright;
 
   if (cfg.wifiMode != "enterprise") cfg.wifiMode = "personal";
+  if (cfg.apiUrl.isEmpty()) cfg.apiUrl = DEFAULT_API_URL;
 
   saveConfig();
 
@@ -733,28 +614,15 @@ bool fetchIQAirAndUpdateLed() {
     return false;
   }
 
-  float lat, lon;
-  if (cfg.apiKey.isEmpty()) {
-    Serial.println("IQAir API key is empty.");
-    blinkColor(255, 0, 0, 2);
-    return false;
-  }
-  if (!isValidLatLon(cfg.latitude, cfg.longitude, lat, lon)) {
-    Serial.println("Latitude/Longitude invalid.");
-    blinkColor(255, 0, 0, 2);
-    return false;
-  }
-
-  String url = buildIQAirUrl();
   HTTPClient http;
   http.setTimeout(15000);
 
   Serial.print("GET: ");
-  Serial.println(url);
+  Serial.println(cfg.apiUrl);
 
-  if (!http.begin(url)) {
+  if (!http.begin(cfg.apiUrl)) {
     Serial.println("HTTP begin failed.");
-    blinkColor(255, 0, 0, 2);
+    blinkColor(0, 0, 255, 2);
     return false;
   }
 
@@ -762,56 +630,42 @@ bool fetchIQAirAndUpdateLed() {
   if (httpCode <= 0) {
     Serial.printf("HTTP GET failed: %d\n", httpCode);
     http.end();
-    blinkColor(255, 0, 0, 2);
+    blinkColor(0, 0, 255, 2);
     return false;
   }
 
   Serial.printf("HTTP code: %d\n", httpCode);
 
   if (httpCode != HTTP_CODE_OK) {
-    String errBody = http.getString();
-    Serial.println(errBody);
     http.end();
-    blinkColor(255, 0, 0, 2);
+    blinkColor(0, 0, 255, 2);
     return false;
   }
 
   String payload = http.getString();
   http.end();
 
-  DynamicJsonDocument doc(32 * 1024);
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
     Serial.print("JSON parse failed: ");
     Serial.println(err.c_str());
-    blinkColor(255, 0, 0, 2);
+    blinkColor(0, 0, 255, 2);
     return false;
   }
 
-  const char* status = doc["status"] | "";
-  if (String(status) != "success") {
-    Serial.print("API status not success: ");
-    Serial.println(status);
-    blinkColor(255, 0, 0, 2);
-    return false;
-  }
-
-  int aqius = doc["data"]["current"]["pollution"]["aqius"] | -1;
-  int aqicn = doc["data"]["current"]["pollution"]["aqicn"] | -1;
-  const char* mainus = doc["data"]["current"]["pollution"]["mainus"] | "";
-  const char* ts = doc["data"]["current"]["pollution"]["ts"] | "";
-  const char* city = doc["data"]["city"] | "";
-  const char* state = doc["data"]["state"] | "";
-  const char* country = doc["data"]["country"] | "";
+  // เปลี่ยนจาก current.pm25.aqius -> current.aqius
+  int aqius = doc["current"]["aqius"] | -1;
+  float pm25Conc = doc["current"]["pm25"]["conc"] | -1.0;
+  const char* ts = doc["current"]["ts"] | "";
 
   if (aqius < 0) {
-    Serial.println("data.current.pollution.aqius field missing.");
-    blinkColor(255, 0, 0, 2);
+    Serial.println("current.aqius field missing.");
+    blinkColor(0, 0, 255, 2);
     return false;
   }
 
-  Serial.printf("Location: %s, %s, %s\n", city, state, country);
-  Serial.printf("AQI(US): %d, AQI(CN): %d, mainus: %s, ts: %s\n", aqius, aqicn, mainus, ts);
+  Serial.printf("AQI(US): %d, PM2.5 conc: %.1f, ts: %s\n", aqius, pm25Conc, ts);
 
   showAQIColor(aqius);
   return true;
@@ -827,7 +681,25 @@ void ensureWiFiAlive() {
     startAPMode();
   }
 }
+void testLedDisplay() {
+  int testAQI[] = {
+    25,    // Good
+    65,    // 51-80
+    90,    // 81-100 Moderate
+    110,   // 101-120 Moderate
+    135,   // 121-150 Sensitive
+    175,   // 151-200 Unhealthy
+    250,   // 201-300 Very Unhealthy
+    350    // 301+ Hazardous
+  };
 
+  int count = sizeof(testAQI) / sizeof(testAQI[0]);
+
+  for (int i = 0; i < count; i++) {
+    showAQIColor(testAQI[i]);
+    delay(500);   // แสดงสีละ 0.5 วินาที
+  }
+}
 // ---------------------------
 // Setup / loop
 // ---------------------------
@@ -838,6 +710,7 @@ void setup() {
   pixel.begin();
   loadConfig();
   applyBrightness();
+  testLedDisplay();
   ledOff();
 
   Serial.println("Boot: try saved WiFi first.");
